@@ -1550,6 +1550,7 @@ class LRUPromptCache:
     class CacheEntry:
         prompt_cache: List[Any]
         nbytes: int
+        cache_type: str
 
     class CacheOrder:
         def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
@@ -1586,6 +1587,7 @@ class LRUPromptCache:
         self._trie = PromptTrie()
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
+        self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
 
     def __len__(self):
         return len(self._lru)
@@ -1626,14 +1628,16 @@ class LRUPromptCache:
     ):
         # Make the cache entry
         entry = LRUPromptCache.CacheEntry(
-            prompt_cache, sum(c.nbytes for c in prompt_cache)
+            prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type
         )
 
         # Insert into the trie and update the byte counter and lru position
         self._n_bytes += entry.nbytes
+        self._n_bytes_by_type[cache_type] += entry.nbytes
         prev = self._trie.add(model, tokens, entry)
         if prev is not None:
             self._n_bytes -= prev.nbytes
+            self._n_bytes_by_type[prev.cache_type] -= prev.nbytes
             self._lru.remove(model, tokens)
         self._lru.push(model, tokens, cache_type)
 
@@ -1642,6 +1646,7 @@ class LRUPromptCache:
         if can_trim_prompt_cache(prompt_cache):
             for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
                 self._n_bytes -= entry.nbytes
+                self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
                 self._lru.remove(model, tokens[:prefix_len])
 
         # Ensure we match the constraints
@@ -1649,10 +1654,12 @@ class LRUPromptCache:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
             self._n_bytes -= entry.nbytes
+            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
         while self._n_bytes > self.max_bytes:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
             self._n_bytes -= entry.nbytes
+            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
 
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
@@ -1664,7 +1671,18 @@ class LRUPromptCache:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
             self._n_bytes -= entry.nbytes
+            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
         while self._n_bytes > n_bytes:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
             self._n_bytes -= entry.nbytes
+            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+
+    def stats_by_type(self):
+        result = {}
+        for cache_type in self._lru._ordering:
+            result[cache_type] = {
+                "n_sequences": len(self._lru._lrus[cache_type]),
+                "n_bytes": self._n_bytes_by_type[cache_type],
+            }
+        return result
